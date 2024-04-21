@@ -1,2 +1,2 @@
 # casambibt2mqtt
-A simple bridge from CasambiBT to Mqtt
+A simple bridge from CasambiBT to Mqtt that supports Homeassistant MQTT discovery
