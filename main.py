@@ -22,7 +22,7 @@ class OpCode(IntEnum):
 
 
 async def main() -> None:
-    logging.getLogger("CasambiBt").setLevel(logging.INFO)
+    logging.getLogger("CasambiBt")
     logger = logging.getLogger()
     mqttLogger = logging.getLogger("MQTT")
 
@@ -59,6 +59,8 @@ async def main() -> None:
 
         mqtt_prefix = "casambi/"
 
+        stop_signal = asyncio.Event()
+
         async def listen():
             try:
                 await client.subscribe(mqtt_prefix + "#")
@@ -71,7 +73,7 @@ async def main() -> None:
                         logger.info("Executing action for " + topic_value + " -> " + param)
                         await action(param)
             except aiomqtt.MqttError:
-                loop.stop()
+                stop_signal.set()
 
         asyncio.ensure_future(listen())
 
@@ -90,15 +92,30 @@ async def main() -> None:
                     c = 2 ** control.length - 1
                     level = int(c * ((temperature - control.min) / (control.max - control.min)))
                     if level < 0 or level > c:
-                        raise ValueError()
+                        raise ValueError("Temperature out of range " + str(temperature) + " -> " + str(level))
 
                     payload = level.to_bytes(1, byteorder="big", signed=False)
                     await casa._send(target, payload, OpCode.SetTemperature)
 
         async def update_unit(unit: Unit) -> None:
             name = str(unit.uuid)
+
+            state = {
+                'state': "ON" if unit.is_on else "OFF",
+            }
+
+            if unit.state is not None:
+                if unit.unitType.get_control(UnitControlType.WHITE) is not None:
+                    state["white"] = unit.state.white
+                if unit.unitType.get_control(UnitControlType.VERTICAL) is not None:
+                    state["vertical"] = unit.state.vertical
+                if unit.unitType.get_control(UnitControlType.TEMPERATURE) is not None:
+                    state["color_temp"] = int(1000000/unit.state.temperature)
+                if unit.unitType.get_control(UnitControlType.DIMMER) is not None:
+                    state["brightness"] = unit.state.dimmer
+
+            await publish_async(name + "/state", json.dumps(state))
             await publish_async(name + "/availability", "online" if unit.online else "offline")
-            await publish_async(name + "/state", "ON" if unit.is_on else "OFF")
             if unit.state is not None:
                 await publish_async(name + "/white", unit.state.white) if (unit.
                                                                            unitType.get_control(
@@ -155,7 +172,7 @@ async def main() -> None:
                     ],
                     'availability_mode': 'all',
                     'payload_available': 'online',
-                    'payload_unavailable': 'offline',
+                    'payload_not_available': 'offline',
                     'device': {
                         'identifiers': ['casambibt2mqtt_' + str(unit.uuid)],
                         'manufacturer': 'Casambi',
@@ -163,13 +180,19 @@ async def main() -> None:
                         'name': unit.name,
                         'sw_version': unit.firmwareVersion
                     },
+                    'schema': 'json',
                     'name': None,
                     'supported_color_modes': [],
                     'unique_id': str(unit.uuid) + "_light_casambibt2mqtt",
                 }
 
-                config["supported_color_modes"].append("color_temp") if unit.unitType.get_control(UnitControlType.TEMPERATURE) is not None else None
+                if unit.unitType.get_control(UnitControlType.TEMPERATURE) is not None:
+                    temperature_config["min_mireds"] = int(1000000 / unit.unitType.get_control(UnitControlType.TEMPERATURE).max)
+                    temperature_config["max_mireds"] = int(1000000 / unit.unitType.get_control(UnitControlType.TEMPERATURE).min)
+                    config["supported_color_modes"].append("color_temp")
+
                 config["supported_color_modes"].append("white") if unit.unitType.get_control(UnitControlType.WHITE) is not None else None
+                config["supported_color_modes"].append("brightness") if unit.unitType.get_control(UnitControlType.DIMMER) is not None else None
 
                 config.update(temperature_config) if unit.unitType.get_control(UnitControlType.TEMPERATURE) is not None else None
                 config.update(dimmer_config) if unit.unitType.get_control(UnitControlType.DIMMER) is not None else None
@@ -197,12 +220,16 @@ async def main() -> None:
                             await casa.setLevel(unit, command["brightness"])
                         if "white" in command:
                             await casa.setWhite(unit, command["white"])
-                        if "temperature" in command:
-                            await casa_set_temperature(casa, unit, command["temperature"])
+                        if "color_temp" in command:
+                            temp = int(1000000 / command["color_temp"])
+                            temp = max(unit.unitType.get_control(UnitControlType.TEMPERATURE).min, min(temp, unit.unitType.get_control(UnitControlType.TEMPERATURE).max))
+                            await casa_set_temperature(casa, unit, temp)
                         if "vertical" in command:
                             await casa.setVertical(unit, command["vertical"])
                         if "state" in command and command["state"] == "OFF":
                             await casa.setLevel(unit, 0)
+                        if "state" in command and command["state"] == "ON" and not unit.is_on:
+                            await casa.turnOn(unit)
                     else:
                         if value == "ON":
                             await casa.turnOn(unit)
@@ -211,7 +238,6 @@ async def main() -> None:
                         else:
                             logger.warning("Invalid value passed to state: " + name + " " + value)
                             return
-                        await publish_async(name + "/state", "ON" if unit.is_on else "OFF")
                 except CancelledError:
                     logger.exception("Cancelled action " + name)
 
@@ -274,23 +300,23 @@ async def main() -> None:
             loop.create_task(update_unit(unit))
 
         def bluetooth_disconnected() -> None:
-            logger.debug("Bluetooth disconnected")
-            stop_program()
+            logger.warning("Bluetooth disconnected")
+            stop_signal.set()
+
 
         async def update_availability(available: bool) -> None:
             await publish_async("availability", 'online' if available else 'offline')
 
         def stop_program():
             logger.warning("Stopping...")
-            loop.create_task(update_availability(False))
-            loop.stop()
+            stop_signal.set()
 
         await update_availability(False)
 
         casa = Casambi()
 
         try:
-            await casa.connect(bleakdevice, password)
+            await casa.connect(bleakdevice, password, forceOffline=True)
             casa.registerUnitChangedHandler(unit_changed)
             casa.registerDisconnectCallback(bluetooth_disconnected)
             logger.info("Connected.")
@@ -305,15 +331,18 @@ async def main() -> None:
             for signame in ('SIGINT', 'SIGTERM'):
                 loop.add_signal_handler(getattr(signal, signame), stop_program)
 
-            while True:
-                await asyncio.sleep(5)
+            await stop_signal.wait()
+            await update_availability(False)
+            await asyncio.sleep(1)
 
         finally:
             casa.unregisterUnitChangedHandler(unit_changed)
             await casa.disconnect()
             await update_availability(False)
+            await client.__aexit__(None, None, None)
             logger.warning("Exiting.")
-            stop_program()
+            await asyncio.sleep(2)
+            loop.stop()
 
 
 if __name__ == "__main__":
